@@ -404,6 +404,26 @@
     }
 
     .day-temps span:last-child { color: var(--muted); font-weight: 500; }
+    .forecast-ml {
+      margin-top: 9px;
+      padding-top: 7px;
+      border-top: 1px dashed var(--line);
+      color: var(--muted);
+      font-size: 9px;
+      line-height: 1.3;
+    }
+
+    .forecast-ml.ready { color: var(--ink); }
+    .forecast-ml.unavailable { color: var(--muted); }
+    .ml-status {
+      margin: 11px 0 0;
+      color: var(--muted);
+      font-size: 10px;
+      line-height: 1.5;
+    }
+
+    .ml-validation { color: var(--ink); font-weight: 650; }
+    .ml-method { margin-top: 7px; }
 
     footer {
       padding: 0 22px 19px;
@@ -428,6 +448,7 @@
       .forecast-section { padding-right: 16px; padding-left: 16px; }
       .day-card { padding-right: 2px; padding-left: 2px; }
       .day-temps { gap: 3px; font-size: 11px; }
+      .forecast-ml { font-size: 8px; }
     }
 
     @media (prefers-reduced-motion: reduce) {
@@ -531,9 +552,15 @@
     <section class="forecast-section" aria-labelledby="forecast-title">
       <div class="section-heading">
         <h2 id="forecast-title">5-day forecast</h2>
-        <span>Next few days</span>
+        <span>Official + ML analog</span>
       </div>
       <div class="forecast" id="forecast"></div>
+      <p class="ml-status" id="ml-status" role="status" aria-live="polite">Machine-learning baseline will train from historical weather data.</p>
+      <p class="ml-status ml-validation" id="ml-validation"></p>
+      <details class="method ml-method">
+        <summary>About the ML forecast</summary>
+        <p>A k-nearest-neighbors analog model learns from eight years of daily temperatures for this location. It matches recent seven-day temperature patterns and season, then predicts the next five daily highs and lows. Walk-forward mean absolute error is compared with a persistence baseline (the latest observed high/low). This experimental baseline is separate from the operational weather forecast.</p>
+      </details>
     </section>
 
     <footer>Weather data by <a href="https://open-meteo.com/" target="_blank" rel="noreferrer">Open-Meteo</a></footer>
@@ -625,11 +652,18 @@
       return new Intl.DateTimeFormat("en", { weekday: "short", timeZone: "UTC" }).format(new Date(date + "T12:00:00Z"));
     }
 
+    function todayIndex(data) {
+      const currentDate = data.current.time?.slice(0, 10);
+      const index = currentDate ? data.daily.time.indexOf(currentDate) : 0;
+      return index >= 0 ? index : 0;
+    }
+
     function forecastRows(data) {
-      return data.daily.time.slice(1, 6).map((date, index) => {
-        const dayIndex = index + 1;
+      const start = todayIndex(data);
+      return Array.from({ length: 5 }, (_, index) => {
+        const dayIndex = start + index + 1;
         return {
-          date,
+          date: data.daily.time[dayIndex],
           weatherCode: data.daily.weather_code[dayIndex],
           high: Number(data.daily.temperature_2m_max[dayIndex]),
           low: Number(data.daily.temperature_2m_min[dayIndex]),
@@ -711,7 +745,8 @@
       $("#wind").textContent = `${Math.round(current.wind_speed_10m ?? 9)} km/h`;
       $("#current-icon").innerHTML = iconMarkup[icon];
       $("#live-label").textContent = isFallback ? "Typical weather" : "Live weather";
-      $("#today-date").textContent = new Intl.DateTimeFormat("en", { weekday: "long", month: "long", day: "numeric" }).format(new Date());
+      const currentDate = current.time?.slice(0, 10) || data.daily.time[todayIndex(data)];
+      $("#today-date").textContent = new Intl.DateTimeFormat("en", { weekday: "long", month: "long", day: "numeric", timeZone: "UTC" }).format(new Date(`${currentDate}T12:00:00Z`));
       renderAnalytics(rows);
 
       $("#forecast").innerHTML = rows.map((row, index) => {
@@ -721,8 +756,12 @@
           <div class="day-name">${formatDay(row.date, dayIndex)}</div>
           <div class="day-icon">${iconMarkup[dayIcon]}</div>
           <div class="day-temps"><span>${Math.round(row.high)}°</span><span>${Math.round(row.low)}°</span></div>
+          <div class="forecast-ml" id="ml-forecast-${index}">${isFallback ? "ML unavailable" : "ML training…"}</div>
         </article>`;
       }).join("");
+      $("#ml-status").textContent = isFallback ? "ML analog model unavailable while using the offline fallback." : "Training a location-specific analog model from historical weather…";
+      $("#ml-validation").textContent = "";
+      $("#ml-validation").hidden = true;
     }
 
     async function getForecast(latitude, longitude, signal) {
@@ -731,12 +770,178 @@
         longitude,
         current: "temperature_2m,apparent_temperature,weather_code,wind_speed_10m",
         daily: "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+        past_days: "7",
         forecast_days: "6",
         timezone: "auto"
       });
       const response = await fetch(`https://api.open-meteo.com/v1/forecast?${params}`, { signal });
       if (!response.ok) throw new Error("Weather service unavailable");
       return response.json();
+    }
+
+    function dayOfYearAngle(date) {
+      const day = new Date(`${date}T00:00:00Z`);
+      const yearStart = Date.UTC(day.getUTCFullYear(), 0, 0);
+      const dayNumber = Math.floor((day.getTime() - yearStart) / 86400000);
+      return 2 * Math.PI * (dayNumber - 1) / 365.2425;
+    }
+
+    function temperatureWindow(highs, lows, endIndex) {
+      const features = [];
+      for (let index = endIndex - 6; index <= endIndex; index++) {
+        if (!Number.isFinite(highs[index]) || !Number.isFinite(lows[index])) return null;
+        features.push(highs[index], lows[index]);
+      }
+      return features;
+    }
+
+    function buildAnalogSamples(history) {
+      const samplesByHorizon = Array.from({ length: 6 }, () => []);
+      for (let origin = 6; origin < history.time.length - 1; origin++) {
+        const features = temperatureWindow(history.highs, history.lows, origin);
+        if (!features) continue;
+        for (let horizon = 1; horizon <= 5 && origin + horizon < history.time.length; horizon++) {
+          const targetIndex = origin + horizon;
+          if (!Number.isFinite(history.highs[targetIndex]) || !Number.isFinite(history.lows[targetIndex])) continue;
+          samplesByHorizon[horizon].push({
+            features,
+            targetDate: history.time[targetIndex],
+            targetIndex,
+            high: history.highs[targetIndex],
+            low: history.lows[targetIndex]
+          });
+        }
+      }
+      return samplesByHorizon;
+    }
+
+    function predictAnalog(samples, features, targetDate, tempScale) {
+      const targetAngle = dayOfYearAngle(targetDate);
+      const nearest = samples.map((sample) => {
+        let squaredTemperatureDistance = 0;
+        for (let index = 0; index < features.length; index++) {
+          const difference = sample.features[index] - features[index];
+          squaredTemperatureDistance += difference * difference;
+        }
+        const temperatureDistance = squaredTemperatureDistance / (features.length * tempScale * tempScale);
+        const seasonalDistance = 1.5 * (1 - Math.cos(dayOfYearAngle(sample.targetDate) - targetAngle));
+        const distance = temperatureDistance + seasonalDistance;
+        const ageYears = Math.max(0, (Date.parse(`${targetDate}T00:00:00Z`) - Date.parse(`${sample.targetDate}T00:00:00Z`)) / 31557600000);
+        return { sample, distance, weight: Math.exp(-ageYears / 10) / (distance + 0.05) };
+      }).sort((left, right) => left.distance - right.distance).slice(0, 30);
+
+      const totalWeight = nearest.reduce((sum, item) => sum + item.weight, 0);
+      if (!nearest.length || !Number.isFinite(totalWeight) || totalWeight === 0) throw new Error("Not enough historical weather analogs");
+      return nearest.reduce((prediction, item) => {
+        prediction.high += item.sample.high * item.weight / totalWeight;
+        prediction.low += item.sample.low * item.weight / totalWeight;
+        return prediction;
+      }, { high: 0, low: 0 });
+    }
+
+    function validateAnalogModel(history, samplesByHorizon, tempScale) {
+      const errors = { model: 0, persistence: 0, count: 0, origins: 0 };
+      const firstValidationOrigin = Math.max(14, history.time.length - 180);
+      for (let origin = firstValidationOrigin; origin < history.time.length - 5; origin += 7) {
+        const features = temperatureWindow(history.highs, history.lows, origin);
+        if (!features) continue;
+        let originEvaluated = false;
+        for (let horizon = 1; horizon <= 5; horizon++) {
+          const targetIndex = origin + horizon;
+          const actualHigh = history.highs[targetIndex];
+          const actualLow = history.lows[targetIndex];
+          if (!Number.isFinite(actualHigh) || !Number.isFinite(actualLow)) continue;
+          const training = samplesByHorizon[horizon].filter((sample) => sample.targetIndex < origin);
+          if (training.length < 30) continue;
+          const prediction = predictAnalog(training, features, history.time[targetIndex], tempScale);
+          errors.model += Math.abs(prediction.high - actualHigh) + Math.abs(prediction.low - actualLow);
+          errors.persistence += Math.abs(history.highs[origin] - actualHigh) + Math.abs(history.lows[origin] - actualLow);
+          errors.count += 2;
+          originEvaluated = true;
+        }
+        if (originEvaluated) errors.origins++;
+      }
+      if (!errors.count) throw new Error("Unable to validate historical analog model");
+      return {
+        modelMae: errors.model / errors.count,
+        persistenceMae: errors.persistence / errors.count,
+        skill: errors.persistence ? 100 * (errors.persistence - errors.model) / errors.persistence : 0,
+        origins: errors.origins
+      };
+    }
+
+    async function trainAnalogForecast(city, forecast, signal) {
+      const currentDayIndex = todayIndex(forecast);
+      const historyEndIndex = currentDayIndex - 7;
+      if (historyEndIndex < 0) throw new Error("Recent forecast history is unavailable");
+      const endDate = forecast.daily.time[historyEndIndex];
+      const start = new Date(`${endDate}T12:00:00Z`);
+      start.setUTCFullYear(start.getUTCFullYear() - 8);
+      const params = new URLSearchParams({
+        latitude: city.latitude,
+        longitude: city.longitude,
+        start_date: start.toISOString().slice(0, 10),
+        end_date: endDate,
+        daily: "temperature_2m_max,temperature_2m_min",
+        timezone: forecast.timezone || "auto"
+      });
+      const response = await fetch(`https://archive-api.open-meteo.com/v1/archive?${params}`, { signal });
+      if (!response.ok) throw new Error("Historical weather is unavailable");
+      const archive = await response.json();
+      if (!archive.daily?.time || archive.daily.time.length < 730) throw new Error("Not enough historical weather to train the model");
+
+      const history = {
+        time: archive.daily.time,
+        highs: archive.daily.temperature_2m_max.map((value) => value == null ? NaN : Number(value)),
+        lows: archive.daily.temperature_2m_min.map((value) => value == null ? NaN : Number(value))
+      };
+      const samplesByHorizon = buildAnalogSamples(history);
+      const allTemps = history.highs.concat(history.lows).filter(Number.isFinite);
+      const mean = allTemps.reduce((sum, value) => sum + value, 0) / allTemps.length;
+      const tempScale = Math.max(1, Math.sqrt(allTemps.reduce((sum, value) => sum + (value - mean) ** 2, 0) / allTemps.length));
+      const validation = validateAnalogModel(history, samplesByHorizon, tempScale);
+      const features = temperatureWindow(
+        forecast.daily.temperature_2m_max.map((value) => value == null ? NaN : Number(value)),
+        forecast.daily.temperature_2m_min.map((value) => value == null ? NaN : Number(value)),
+        currentDayIndex
+      );
+      if (!features) throw new Error("Recent temperatures needed by the model are incomplete");
+      const predictions = Array.from({ length: 5 }, (_, index) => {
+        const horizon = index + 1;
+        const targetDate = forecast.daily.time[currentDayIndex + horizon];
+        const prediction = predictAnalog(samplesByHorizon[horizon], features, targetDate, tempScale);
+        return { ...prediction, date: targetDate };
+      });
+      return { predictions, validation, years: (Date.parse(`${endDate}T00:00:00Z`) - Date.parse(`${history.time[0]}T00:00:00Z`)) / 31557600000 };
+    }
+
+    function renderAnalogForecast(model) {
+      lastForecastRows = lastForecastRows.map((row, index) => {
+        const prediction = model.predictions[index];
+        const element = $(`#ml-forecast-${index}`);
+        element.className = "forecast-ml ready";
+        element.textContent = `ML ${Math.round(prediction.high)}° / ${Math.round(prediction.low)}°`;
+        element.title = `Historical analog estimate: high ${prediction.high.toFixed(1)}°C, low ${prediction.low.toFixed(1)}°C. Official weather model: high ${row.high.toFixed(1)}°C, low ${row.low.toFixed(1)}°C.`;
+        return { ...row, mlHigh: prediction.high, mlLow: prediction.low };
+      });
+      $("#ml-status").textContent = `K-nearest-neighbors analog model · ${model.years.toFixed(1)} years of local daily history · 30 nearest patterns per estimate.`;
+      const { modelMae, persistenceMae, skill, origins } = model.validation;
+      $("#ml-validation").textContent = `Walk-forward MAE (high + low, ${origins} weekly origins): ${modelMae.toFixed(1)}°C vs persistence ${persistenceMae.toFixed(1)}°C · ${skill >= 0 ? "+" : ""}${skill.toFixed(0)}% skill.`;
+      $("#ml-validation").hidden = false;
+    }
+
+    function markAnalogUnavailable(error) {
+      for (let index = 0; index < 5; index++) {
+        const element = $(`#ml-forecast-${index}`);
+        if (element) {
+          element.className = "forecast-ml unavailable";
+          element.textContent = "ML unavailable";
+          element.removeAttribute("title");
+        }
+      }
+      $("#ml-status").textContent = `ML baseline unavailable: ${error.message}. The official forecast is unchanged.`;
+      $("#ml-validation").textContent = "";
+      $("#ml-validation").hidden = true;
     }
 
     async function loadCity(query) {
@@ -762,6 +967,12 @@
         const forecast = await getForecast(city.latitude, city.longitude, controller.signal);
         render(forecast, place, false);
         message.textContent = "";
+        trainAnalogForecast(city, forecast, controller.signal).then((model) => {
+          if (!controller.signal.aborted && loadCity.controller === controller) renderAnalogForecast(model);
+        }).catch((error) => {
+          if (controller.signal.aborted || error.name === "AbortError" || loadCity.controller !== controller) return;
+          markAnalogUnavailable(error);
+        });
       } catch (error) {
         if (error.name === "AbortError") return;
         if (query && error.message.startsWith("No city found")) {
@@ -789,8 +1000,8 @@
     $("#export-csv").addEventListener("click", () => {
       const csvEscape = (value) => `"${String(value).replace(/"/g, '""')}"`;
       const csvRows = [
-        ["date", "city", "weather_code", "high_c", "low_c", "precipitation_probability_percent"],
-        ...lastForecastRows.map((row) => [row.date, lastPlace, row.weatherCode, row.high, row.low, row.rainChance])
+        ["date", "city", "weather_code", "high_c", "low_c", "precipitation_probability_percent", "ml_high_c", "ml_low_c"],
+        ...lastForecastRows.map((row) => [row.date, lastPlace, row.weatherCode, row.high, row.low, row.rainChance, row.mlHigh ?? "", row.mlLow ?? ""])
       ];
       const csv = csvRows.map((row) => row.map(csvEscape).join(",")).join("\r\n");
       const objectUrl = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
